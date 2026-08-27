@@ -1,62 +1,121 @@
 import pandas as pd
 import numpy as np
+import glob
 import os
 
-print("--- BUILDING EXTERNAL SHOCK MATRIX ---")
+print("--- BUILDING MASTER DATASET (WEATHER & ECON) ---")
 
-# 1. Create a base timeline (Starting Jan 2023 to allow calculating 3-to-6 month lags)
-dates = pd.date_range(start='2023-01-01', end='2026-04-01', freq='MS')
-shock_matrix = pd.DataFrame({'Date': dates})
-shock_matrix['YearMonth'] = shock_matrix['Date'].dt.strftime('%Y-%m')
-shock_matrix['Year'] = shock_matrix['Date'].dt.year
-
-# 2. Simulate CPI (Until you map the exact columns from ontario_cpi_monthly.csv)
-np.random.seed(42)
-shock_matrix['Ontario_CPI'] = np.random.uniform(150, 160, len(shock_matrix))
-
-# 3. Process CMHC Rent (Annual -> Forward Filled to Monthly)
-rent_data = pd.DataFrame({
-    'Year': [2023, 2024, 2025, 2026],
-    'Barrie_Avg_Rent': [1800, 1950, 2050, 2050]
-})
-shock_matrix = pd.merge(shock_matrix, rent_data, on='Year', how='left')
-
-# 4. Process Working Poverty (Annual -> Forward Filled to Monthly)
-# We will use a static rate here for the dummy test, but you can hook this up 
-# directly to your simcoe_working_poverty_clean.xlsx file later.
-poverty_data = pd.DataFrame({
-    'Year': [2023, 2024, 2025, 2026],
-    'Simcoe_Poverty_Rate': [8.5, 8.5, 8.5, 8.5] 
-})
-shock_matrix = pd.merge(shock_matrix, poverty_data, on='Year', how='left')
-
-print("--- ENGINEERING LAG FEATURES ---")
-# 5. Create Time-Lagged Features for the Hazard Model
-shock_matrix['CPI_3mo_lag'] = shock_matrix['Ontario_CPI'].shift(3)
-shock_matrix['CPI_6mo_lag'] = shock_matrix['Ontario_CPI'].shift(6)
-shock_matrix['Rent_3mo_lag'] = shock_matrix['Barrie_Avg_Rent'].shift(3)
-
-# Calculate economic momentum (e.g., how much did inflation jump in the last 3 months?)
-shock_matrix['CPI_Momentum_3mo'] = shock_matrix['Ontario_CPI'] - shock_matrix['CPI_3mo_lag']
-
-# Drop the buffer months we only used to calculate the lags (Keep Nov 2023 onward)
-shock_matrix = shock_matrix[shock_matrix['YearMonth'] >= '2023-11'].copy()
-
-print("--- MERGING WITH SHELTER PANEL ---")
-# 6. Load the final shelter panel we just generated
-shelter_panel_path = "../outputs/MODEL_TRAINING_PANEL_FINAL.csv"
+# 1. LOAD SHELTER DATA
+print("Loading shelter panel...")
 try:
-    shelter_panel = pd.read_csv(shelter_panel_path)
-except FileNotFoundError:
-    print(f"CRITICAL ERROR: Could not find '{shelter_panel_path}'.")
+    shelter_df = pd.read_csv("../data_internal/FINAL_MODEL_TRAIN.csv")
+    # Ensure YearMonth is a string
+    shelter_df['YearMonth'] = shelter_df['YearMonth'].astype(str)
+except Exception as e:
+    print(f"CRITICAL ERROR loading shelter data: {e}")
     exit()
 
-# 7. The Grand Merge
-master_dataset = pd.merge(shelter_panel, shock_matrix, on='YearMonth', how='left')
+# 2. AGGREGATE WEATHER DATA
+print("Processing high-frequency meteorological data...")
+weather_files = glob.glob("../data_public/raw_weather/*.csv")
+weather_list = []
 
-# 8. Save the final model-ready dataset
+for f in weather_files:
+    try:
+        df = pd.read_csv(f, low_memory=False)
+        weather_list.append(df)
+    except Exception as e:
+        print(f"Skipping {f}: {e}")
+
+if weather_list:
+    weather_df = pd.concat(weather_list, ignore_index=True)
+    # Create matching YearMonth column
+    weather_df['YearMonth'] = weather_df['Year'].astype(str) + '-' + weather_df['Month'].astype(str).str.zfill(2)
+    
+    # Compress daily readings into monthly hazard triggers
+    monthly_weather = weather_df.groupby('YearMonth').agg({
+        'Min Temp (°C)': 'min',          # Coldest day of the month
+        'Mean Temp (°C)': 'mean',        # Average temperature
+        'Total Snow (cm)': 'sum'         # Cumulative snowfall
+    }).reset_index()
+    
+    monthly_weather.rename(columns={
+        'Min Temp (°C)': 'Extreme_Min_Temp',
+        'Mean Temp (°C)': 'Average_Mean_Temp',
+        'Total Snow (cm)': 'Total_Snow_cm'
+    }, inplace=True)
+else:
+    print("WARNING: No weather files found in data_public/raw_weather/")
+    monthly_weather = pd.DataFrame(columns=['YearMonth', 'Extreme_Min_Temp', 'Average_Mean_Temp', 'Total_Snow_cm'])
+
+# 3. PARSE MACROECONOMIC DATA
+print("Parsing external economic metrics...")
+# Ontario CPI
+try:
+    with open("../data_public/raw_econ/ontario_cpi_monthly.csv", 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    header_idx = [i for i, line in enumerate(lines) if "November 2023" in line][0]
+    
+    cpi_raw = pd.read_csv("../data_public/raw_econ/ontario_cpi_monthly.csv", skiprows=header_idx)
+    cpi_all = cpi_raw[cpi_raw.iloc[:, 0].astype(str).str.contains('All-items', na=False)]
+    
+    cpi_melted = cpi_all.melt(id_vars=cpi_raw.columns[0], var_name='MonthYear', value_name='Ontario_CPI')
+    cpi_melted['YearMonth'] = pd.to_datetime(cpi_melted['MonthYear'], format='%B %Y', errors='coerce').dt.strftime('%Y-%m')
+    cpi_clean = cpi_melted.dropna(subset=['YearMonth'])[['YearMonth', 'Ontario_CPI']].copy()
+    cpi_clean['Ontario_CPI'] = pd.to_numeric(cpi_clean['Ontario_CPI'], errors='coerce')
+except Exception as e:
+    print("WARNING: Could not parse Ontario CPI perfectly. Using fallback.")
+    cpi_clean = pd.DataFrame(columns=['YearMonth', 'Ontario_CPI'])
+
+# Barrie Rent
+try:
+    csd = pd.read_csv("../data_public/raw_econ/CSD_202410_CDP.csv", low_memory=False, encoding='latin1')
+    barrie_rent = csd[
+        (csd['CSDNAME'] == 'Barrie') & 
+        (csd['bedroom_type'] == '2 Bedrooms') & 
+        (csd['dwelling_type'] == 'Apartment') &
+        (csd['construction_year_range'] == 'Overall') &
+        (csd['size_in_units_range'] == 'Overall') &
+        (csd['rent_range'] == 'Overall')
+    ]
+    rent_clean = barrie_rent[['Year', 'average_rent']].rename(columns={'average_rent': 'Barrie_Avg_Rent'}).dropna()
+    rent_clean['Year'] = rent_clean['Year'].astype(str)
+except Exception as e:
+    print("WARNING: Could not parse Barrie Rent perfectly. Using fallback.")
+    rent_clean = pd.DataFrame(columns=['Year', 'Barrie_Avg_Rent'])
+
+# 4. THE GRAND MERGE
+print("Merging feature space...")
+# Merge Weather
+master_df = pd.merge(shelter_df, monthly_weather, on='YearMonth', how='left')
+
+# Merge CPI
+master_df = pd.merge(master_df, cpi_clean, on='YearMonth', how='left')
+
+# Extract Year from YearMonth to merge annual rent/poverty data
+master_df['MergeYear'] = master_df['YearMonth'].str.slice(0, 4)
+
+# Merge Rent
+master_df = pd.merge(master_df, rent_clean, left_on='MergeYear', right_on='Year', how='left')
+
+# Drop the temporary merge column
+master_df.drop(columns=['MergeYear', 'Year_y'], inplace=True, errors='ignore')
+if 'Year_x' in master_df.columns:
+    master_df.rename(columns={'Year_x': 'Year'}, inplace=True)
+
+# 5. ENGINEER LAGS
+print("Engineering 3-month predictive lags...")
+master_df.sort_values(by=['ShelterName_Clean', 'YearMonth'], inplace=True)
+
+master_df['CPI_3mo_lag'] = master_df.groupby('ShelterName_Clean')['Ontario_CPI'].shift(3)
+master_df['Rent_3mo_lag'] = master_df.groupby('ShelterName_Clean')['Barrie_Avg_Rent'].shift(3)
+master_df['Snow_1mo_lag'] = master_df.groupby('ShelterName_Clean')['Total_Snow_cm'].shift(1)
+
+# Backfill any missing lags strictly for the model matrix
+master_df.bfill(inplace=True)
+
 output_path = "../outputs/MASTER_MODEL_DATASET.csv"
-master_dataset.to_csv(output_path, index=False)
+master_df.to_csv(output_path, index=False)
 
-print(f"Success! Master Model Dataset saved to {output_path}")
-print(master_dataset[['ShelterName_Clean', 'YearMonth', 'Admission_Surge_Flag', 'CPI_3mo_lag', 'Rent_3mo_lag']].head())
+print(f"Success! Fully mapped Master Model Dataset saved to {output_path}")
+print(master_df[['ShelterName_Clean', 'YearMonth', 'Extreme_Min_Temp', 'Total_Snow_cm', 'CPI_3mo_lag']].head())
