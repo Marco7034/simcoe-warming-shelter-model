@@ -1,42 +1,62 @@
 import pandas as pd
 import statsmodels.api as sm
+import os
 
 print("--- LOADING MASTER DATASET ---")
 file_path = "../outputs/MASTER_MODEL_DATASET.csv"
+
+if not os.path.exists(file_path):
+    print(f"CRITICAL ERROR: Could not find {file_path}")
+    exit()
+
 df = pd.read_csv(file_path)
 
-# Drop any rows with NaN values resulting from the lag calculations
-df = df.dropna().copy()
+# Ensure no completely blank rows crash the model
+df.dropna(how='all', inplace=True)
 
-print(f"Dataset loaded. Training on {len(df)} monthly observations.")
+# Define the exact features, including the new meteorological data
+features = [
+    'CPI_3mo_lag', 
+    'Rent_3mo_lag', 
+    'Simcoe_Poverty_Rate', 
+    'Extreme_Min_Temp', 
+    'Total_Snow_cm'
+]
+target = 'Admission_Surge_Flag'
 
-# 1. Define the Target Variable (y)
-y = df['Admission_Surge_Flag']
+# Drop any remaining NaNs specifically in our training columns to ensure mathematical stability
+df_clean = df.dropna(subset=features + [target]).copy()
 
-# 2. Define the Feature Matrix (X)
-# We use the lagged variables to ensure we are forecasting future risk based on past data
-features = ['CPI_3mo_lag', 'Rent_3mo_lag', 'Simcoe_Poverty_Rate']
-X = df[features]
+print(f"Dataset loaded. Training on {len(df_clean)} monthly observations.\n")
 
-# Add a constant (intercept) for the statsmodels regression
+if len(df_clean) == 0:
+    print("CRITICAL ERROR: 0 observations remaining after dropping NaNs. Check your data merges.")
+    exit()
+
+print("--- FITTING DISCRETE-TIME LOGISTIC HAZARD MODEL ---")
+X = df_clean[features]
+y = df_clean[target]
+
+# Add a constant for the intercept
 X = sm.add_constant(X)
 
-print("\n--- FITTING DISCRETE-TIME LOGISTIC HAZARD MODEL ---")
-# 3. Fit the Logistic Regression model
 try:
+    # Fit the logistic regression model
     hazard_model = sm.Logit(y, X).fit(disp=False)
+    
     print("\n--- MODEL SUMMARY ---")
     print(hazard_model.summary())
+    
+    # Generate the probability forecast
+    df_clean['Surge_Probability_Forecast'] = hazard_model.predict(X)
+    
+    # Isolate the final output for PowerBI
+    output_df = df_clean[['ShelterName_Clean', 'YearMonth', 'Admission_Surge_Flag', 'Surge_Probability_Forecast']]
+    
+    forecast_path = "../outputs/SCORED_SHELTER_FORECAST.csv"
+    output_df.to_csv(forecast_path, index=False)
+    
+    print(f"\nSuccess! Scored forecast dataset saved to {forecast_path}")
+
 except Exception as e:
     print(f"Model fitting failed. Error: {e}")
-
-# 4. Generate Forecast Probabilities
-# This generates the % risk of a surge for each row based on the economic inputs
-df['Surge_Probability_Forecast'] = hazard_model.predict(X)
-
-# 5. Save the Scored Dataset for Dashboarding
-output_path = "../outputs/SCORED_SHELTER_FORECAST.csv"
-df.to_csv(output_path, index=False)
-
-print(f"\nSuccess! Scored forecast dataset saved to {output_path}")
-print(df[['ShelterName_Clean', 'YearMonth', 'Admission_Surge_Flag', 'Surge_Probability_Forecast']].head())
