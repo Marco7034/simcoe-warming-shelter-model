@@ -53,8 +53,8 @@ try:
     header_idx = [i for i, line in enumerate(lines) if "November 2023" in line][0]
     
     cpi_raw = pd.read_csv("../data_public/raw_econ/ontario_cpi_monthly.csv", skiprows=header_idx)
-    cpi_all = cpi_raw[cpi_raw.iloc[:, 0].astype(str).str.contains('All-items', na=False)]
-    
+    cpi_all = cpi_raw[cpi_raw.iloc[:, 0].astype(str).str.contains('All-items', na=False)].head(1)
+
     cpi_melted = cpi_all.melt(id_vars=cpi_raw.columns[0], var_name='MonthYear', value_name='Ontario_CPI')
     cpi_melted['YearMonth'] = pd.to_datetime(cpi_melted['MonthYear'], format='%B %Y', errors='coerce').dt.strftime('%Y-%m')
     cpi_clean = cpi_melted.dropna(subset=['YearMonth'])[['YearMonth', 'Ontario_CPI']].copy()
