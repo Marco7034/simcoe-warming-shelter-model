@@ -15,10 +15,10 @@ df = pd.read_csv(file_path)
 df.dropna(how='all', inplace=True)
 
 # Define the exact features, including the new meteorological data
+# Define the exact features, removing the constant Poverty Rate
 features = [
     'CPI_3mo_lag', 
     'Rent_3mo_lag', 
-    'Simcoe_Poverty_Rate', 
     'Extreme_Min_Temp', 
     'Total_Snow_cm'
 ]
