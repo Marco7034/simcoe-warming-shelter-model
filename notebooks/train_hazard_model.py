@@ -20,7 +20,6 @@ features = [
     'CPI_3mo_lag', 
     'Rent_3mo_lag', 
     'Extreme_Min_Temp', 
-    'Total_Snow_cm'
 ]
 target = 'Admission_Surge_Flag'
 
